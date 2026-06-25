@@ -4,65 +4,100 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from tokenizers import ByteLevelBPETokenizer
 
-# --- Setup ---
+# ==========================================
+# 1. GLOBAL SETTINGS & HYPERPARAMETERS
+# ==========================================
+# Suppress Hugging Face download/symlink environment noise
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-print(f"🚀 INITIALIZING V14 STABILIZED ENGINE ON: {device}")
+# Network Architecture Specs
+EMBED_DIM = 512       # Scaled up to 512 to fully utilize GPU compute cores
+NUM_HEADS = 8
+NUM_LAYERS = 4
+BLOCK_SIZE = 64      # Maximum context length the model can read at once
+BATCH_SIZE = 128     # Increased batch size for superior hardware parallelization
+DROPOUT = 0.1
 
-# --- Data Loading ---
+# Optimization Specs
+WEIGHT_DECAY = 0.005
+TOTAL_STEPS = 2000    # Total training steps (replaces slow epoch-based loops)
+EVAL_INTERVAL = 50  # How often to check validation loss and save weights
+
+# ==========================================
+# 2. UNIVERSAL HARDWARE ENGINE SELECTOR
+# ==========================================
+if torch.cuda.is_available():
+    device = torch.device("cuda")          # Standard Windows/Linux NVIDIA GPUs
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")           # Apple Silicon M-Series GPUs (Mac)
+else:
+    device = torch.device("cpu")           # Fallback safety safety mechanism
+
+print(f"🚀 INITIALIZING ENGINE ON: {device}")
+
+# ==========================================
+# 3. TEXT LOADING & TOKENIZER MANAGEMENT
+# ==========================================
 file_path = "essays.txt"
+TOKENIZER_DIR = "tokenizer_model"
+
 with open(file_path, "r", encoding="utf-8") as f:
     corpus_text = f.read()
 
-from tokenizers import ByteLevelBPETokenizer
-tokenizer = ByteLevelBPETokenizer()
-
-with open("temp_corpus.txt", "w", encoding="utf-8") as t:
-    t.write(corpus_text)
-
-tokenizer.train(["temp_corpus.txt"], vocab_size=2048, special_tokens=["<s>", "<pad>", "</s>", "<unk>"])
-os.remove("temp_corpus.txt")
+# Safe Save/Load Tokenizer Pipeline
+if os.path.exists(TOKENIZER_DIR):
+    print("💾 Loading existing persistent tokenizer from disk...")
+    tokenizer = ByteLevelBPETokenizer.from_file(
+        vocab_filename=f"{TOKENIZER_DIR}/vocab.json", 
+        merges_filename=f"{TOKENIZER_DIR}/merges.txt"
+    )
+else:
+    print("⏳ No tokenizer found. Training a fresh pipeline...")
+    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    with open("temp_corpus.txt", "w", encoding="utf-8") as t:
+        t.write(corpus_text)
+        
+    tokenizer = ByteLevelBPETokenizer()
+    tokenizer.train(["temp_corpus.txt"], vocab_size=2048, special_tokens=["<s>", "<pad>", "</s>", "<unk>"])
+    tokenizer.save_model(TOKENIZER_DIR)
+    os.remove("temp_corpus.txt")
+    print(f"✅ Tokenizer saved permanently to '{TOKENIZER_DIR}/'")
 
 vocab = tokenizer.get_vocab()
 VOCAB_SIZE = tokenizer.get_vocab_size()
 PAD_IDX, EOS_IDX = vocab["<pad>"], vocab["</s>"]
 
+# ==========================================
+# 4. HIGH-PERFORMANCE NATIVE GPU PIPELINE
+# ==========================================
+# Tokenize and push entire corpus to GPU immediately to eliminate CPU-to-GPU data lag
 corpus_tokens = tokenizer.encode(corpus_text).ids
 split_idx = int(0.9 * len(corpus_tokens))
-train_tokens, val_tokens = corpus_tokens[:split_idx], corpus_tokens[split_idx:]
 
-class ScratchTokenDataset(Dataset):
-    def __init__(self, tokens, block_size):
-        self.tokens_tensor = torch.tensor(tokens, dtype=torch.long)
-        self.block_size = block_size
-        # FIX: Chunk data cleanly without 64x redundant sliding window overlaps
-        self.num_blocks = len(self.tokens_tensor) // block_size
+train_data = torch.tensor(corpus_tokens[:split_idx], dtype=torch.long, device=device)
+val_data = torch.tensor(corpus_tokens[split_idx:], dtype=torch.long, device=device)
 
-    def __len__(self): 
-        return max(0, self.num_blocks - 1)
+def get_batch(split="train"):
+    """
+    Blazingly fast batch generation. Generates randomized, perfectly sliding 
+    overlapping windows directly inside GPU memory space. Completely bypasses PyTorch DataLoader.
+    """
+    data = train_data if split == "train" else val_data
+    # Pick random starting positions across the entire sequence length
+    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    
+    # Stack sub-segments cleanly on the active hardware engine
+    x = torch.stack([data[i : i + BLOCK_SIZE] for i in ix])
+    y = torch.stack([data[i + 1 : i + BLOCK_SIZE + 1] for i in ix])
+    return x, y
 
-    def __getitem__(self, idx):
-        # Jump by block_size steps to feed unique text streams every time
-        start_idx = idx * self.block_size
-        return (
-            self.tokens_tensor[start_idx : start_idx + self.block_size], 
-            self.tokens_tensor[start_idx + 1 : start_idx + self.block_size + 1]
-        )
-
-# --- Hyperparameters ---
-EMBED_DIM = 128
-NUM_HEADS = 8
-NUM_LAYERS = 4
-BLOCK_SIZE = 64
-BATCH_SIZE = 64
-DROPOUT = 0.1
-WEIGHT_DECAY = 0.01
-
-# --- Core Architecture ---
+# ==========================================
+# 5. CORE NEURAL NETWORK ARCHITECTURE
+# ==========================================
 class PositionalEncodingFromScratch(nn.Module):
     def __init__(self, embed_dim, max_len=256):
         super().__init__()
@@ -72,7 +107,9 @@ class PositionalEncodingFromScratch(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe.unsqueeze(0))
-    def forward(self, x): return x + self.pe[:, :x.size(1)]
+        
+    def forward(self, x): 
+        return x + self.pe[:, :x.size(1)]
 
 class PureMultiHeadAttentionFromScratch(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
@@ -148,68 +185,92 @@ class PureScratchTransformer(nn.Module):
         for block in self.blocks: x = block(x, retain_attention=retain_attention)
         return self.W_output(self.norm_final(x))
 
+# Instantiate and bind the model to the active computing engine
 model = PureScratchTransformer(
     vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS, dropout=DROPOUT
 ).to(device)
 
-# --- Training Loop ---
-def train_scratch_model(epochs=5):
+# ==========================================
+# 6. PIPELINED TRAINING ENGINE
+# ==========================================
+def train_scratch_model():
     weight_file = "scratch_weights.pt"
     if os.path.exists(weight_file):
-        print("🔄 Loading existing stable weights...")
+        print("🔄 Loading existing stable weights (cross-device mapped)...")
         model.load_state_dict(torch.load(weight_file, map_location=device))
 
-    train_loader = DataLoader(ScratchTokenDataset(train_tokens, block_size=BLOCK_SIZE), batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(ScratchTokenDataset(val_tokens, block_size=BLOCK_SIZE), batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
-
-    # FIX: Reverted to ultra-stable foreach execution to prevent Apple Silicon driver crashes
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0006, weight_decay=WEIGHT_DECAY, foreach=True)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TOTAL_STEPS)
     best_val_loss = float('inf')
 
-    print(f"📊 Total train batches per epoch: {len(train_loader)} (Clean, zero-bloat dataset)")
+    print(f"📊 Starting unified execution stream for {TOTAL_STEPS} steps...")
+    step_start = time.time()
+    total_train_loss = 0
 
-    for epoch in range(epochs):
+    # Initialize a master progress bar for the entire training run
+    progress_bar = tqdm(total=TOTAL_STEPS, desc="🧠 Training Progress", unit="step")
+
+    for step in range(1, TOTAL_STEPS + 1):
         model.train()
-        total_train_loss, step_start = 0, time.time()
         
-        for batch_idx, (batch_x, batch_y) in enumerate(train_loader):
-            batch_x, batch_y = batch_x.to(device, non_blocking=True), batch_y.to(device, non_blocking=True)
-            
-            optimizer.zero_grad(set_to_none=True)
-            
-            # FIX: Dropped buggy autocast block. Running pure FP32 for maximum numerical stability.
-            logits = model(batch_x)
-            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), batch_y.view(-1))
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_train_loss += loss.item()
-
-            if batch_idx % 200 == 0 and batch_idx > 0:
-                print(f"   [Epoch {epoch+1}] Batch {batch_idx:03d}/{len(train_loader)} | Loss: {loss.item():.4f} | Time/200: {time.time() - step_start:.2f}s")
-                step_start = time.time()
-
+        # Grab a batch natively from active GPU device memory
+        batch_x, batch_y = get_batch("train")
+        
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(batch_x)
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), batch_y.view(-1))
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
         scheduler.step()
-
-        # Validation
-        model.eval()
-        total_val_loss = 0
-        with torch.inference_mode():
-            for val_x, val_y in val_loader:
-                total_val_loss += F.cross_entropy(model(val_x.to(device)).view(-1, VOCAB_SIZE), val_y.to(device).view(-1)).item()
         
-        avg_train = total_train_loss / len(train_loader)
-        avg_val = total_val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
-        print(f"► Epoch {epoch+1:02d}/{epochs} | Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
+        total_train_loss += loss.item()
         
-        if avg_val < best_val_loss and avg_val > 0:
-            best_val_loss = avg_val
-            torch.save(model.state_dict(), weight_file)
-            print("   [SAVED BEST MODEL]")
+        # Update the progress bar by 1 step, displaying the live loss value
+        progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+        progress_bar.update(1)
 
-# --- Sampling & Exec ---
+        # Interval Validation Evaluation Block
+        if step % EVAL_INTERVAL == 0:
+            avg_train_loss = total_train_loss / EVAL_INTERVAL
+            
+            # Pause progress bar printing layout momentarily to log evaluation stats cleanly
+            progress_bar.write("\n⏳ Running mid-training validation check...")
+            
+            # Validation Step
+            model.eval()
+            total_val_loss = 0
+            val_iters = 20  
+            with torch.inference_mode():
+                for _ in range(val_iters):
+                    val_x, val_y = get_batch("val")
+                    val_logits = model(val_x)
+                    total_val_loss += F.cross_entropy(val_logits.view(-1, VOCAB_SIZE), val_y.view(-1)).item()
+            
+            avg_val_loss = total_val_loss / val_iters
+            
+            # Write out metrics using progress_bar.write to prevent breaking the slider bar layout
+            progress_bar.write(
+                f"► Step {step:04d}/{TOTAL_STEPS} | Train Loss: {avg_train_loss:.4f} | "
+                f"Val Loss: {avg_val_loss:.4f} | Interval Time: {time.time() - step_start:.2f}s"
+            )
+            
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), weight_file)
+                progress_bar.write("   [SAVED BEST MODEL CONFIGURATION]")
+                
+            total_train_loss = 0
+            step_start = time.time()
+            progress_bar.write("=" * 50 + "\n")
+
+    # Cleanly close the visual display layout when complete
+    progress_bar.close()
+
+# ==========================================
+# 7. SAMPLING & GENERATION ENGINE
+# ==========================================
 def top_p_filtering(logits, top_p=0.85, filter_value=-float('Inf')):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -248,8 +309,11 @@ def run_scratch_generation(prompt, max_new_tokens=50, temperature=0.8, top_p=0.8
 
     print(f"\n[Perf Stat: {len(generated_tokens) / (time.time() - start_time):.2f} tokens/sec]")
 
+# ==========================================
+# 8. EXECUTION GATEWAY
+# ==========================================
 if __name__ == "__main__":
-    train_scratch_model(epochs=5)
-    for p in ["the sky is made of", "during the twentieth century, the global economy"]:
+    train_scratch_model()
+    for p in ["the sky is made of", "during the twentieth century, the global economy", "there are six legs on a", "four times six is larger than", "Steve Harvey performs on the famous game show", "The cat is", "The dog is", "The cat and the dog are","He eats the","Notably,","Chinese Businessman Jack Ma ate"," ","I love fruits and"]:
         run_scratch_generation(p)
         print("\n" + "="*50)
