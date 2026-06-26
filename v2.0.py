@@ -15,11 +15,11 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 
 # Network Architecture Specs
-EMBED_DIM = 768       # Standard "Base" size (or 512 if you want to play it safe)
-NUM_HEADS = 12        # EMBED_DIM must be perfectly divisible by NUM_HEADS (768 / 12 = 64)
-NUM_LAYERS = 6        # Deeper network allows for more complex grammar rules
-BLOCK_SIZE = 256      # Crucial! Gives the model a 4x longer memory window
-BATCH_SIZE = 64       # Dropped from 128 to offset the memory increase from BLOCK_SIZE
+EMBED_DIM = 512    
+NUM_HEADS = 8    
+NUM_LAYERS = 4   
+BLOCK_SIZE = 64    
+BATCH_SIZE = 128       
 # Optimization Specs
 WEIGHT_DECAY = 0.005
 TOTAL_STEPS = 2000    # Total training steps (replaces slow epoch-based loops)
