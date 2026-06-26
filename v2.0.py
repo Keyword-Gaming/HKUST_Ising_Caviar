@@ -40,7 +40,7 @@ print(f"🚀 INITIALIZING ENGINE ON: {device}")
 # ==========================================
 # 3. TEXT LOADING & TOKENIZER MANAGEMENT
 # ==========================================
-file_path = "essays.txt"
+file_path = "tinystories.txt"
 TOKENIZER_DIR = "tokenizer_model"
 
 with open(file_path, "r", encoding="utf-8") as f:
