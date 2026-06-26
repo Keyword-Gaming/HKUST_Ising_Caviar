@@ -15,17 +15,15 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 
 # Network Architecture Specs
-EMBED_DIM = 512       # Scaled up to 512 to fully utilize GPU compute cores
-NUM_HEADS = 8
-NUM_LAYERS = 4
-BLOCK_SIZE = 64      # Maximum context length the model can read at once
-BATCH_SIZE = 128     # Increased batch size for superior hardware parallelization
-DROPOUT = 0.1
-
+EMBED_DIM = 768       # Standard "Base" size (or 512 if you want to play it safe)
+NUM_HEADS = 12        # EMBED_DIM must be perfectly divisible by NUM_HEADS (768 / 12 = 64)
+NUM_LAYERS = 6        # Deeper network allows for more complex grammar rules
+BLOCK_SIZE = 256      # Crucial! Gives the model a 4x longer memory window
+BATCH_SIZE = 64       # Dropped from 128 to offset the memory increase from BLOCK_SIZE
 # Optimization Specs
 WEIGHT_DECAY = 0.005
 TOTAL_STEPS = 2000    # Total training steps (replaces slow epoch-based loops)
-EVAL_INTERVAL = 50  # How often to check validation loss and save weights
+EVAL_INTERVAL = 200  # How often to check validation loss and save weights
 
 # ==========================================
 # 2. UNIVERSAL HARDWARE ENGINE SELECTOR
@@ -62,7 +60,7 @@ else:
         t.write(corpus_text)
         
     tokenizer = ByteLevelBPETokenizer()
-    tokenizer.train(["temp_corpus.txt"], vocab_size=2048, special_tokens=["<s>", "<pad>", "</s>", "<unk>"])
+    tokenizer.train(["temp_corpus.txt"], vocab_size=8192, special_tokens=["<s>", "<pad>", "</s>", "<unk>"])
     tokenizer.save_model(TOKENIZER_DIR)
     os.remove("temp_corpus.txt")
     print(f"✅ Tokenizer saved permanently to '{TOKENIZER_DIR}/'")
@@ -82,17 +80,17 @@ train_data = torch.tensor(corpus_tokens[:split_idx], dtype=torch.long, device=de
 val_data = torch.tensor(corpus_tokens[split_idx:], dtype=torch.long, device=device)
 
 def get_batch(split="train"):
-    """
-    Blazingly fast batch generation. Generates randomized, perfectly sliding 
-    overlapping windows directly inside GPU memory space. Completely bypasses PyTorch DataLoader.
-    """
     data = train_data if split == "train" else val_data
-    # Pick random starting positions across the entire sequence length
-    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,), device=device) # Explicitly match device here too just in case
     
-    # Stack sub-segments cleanly on the active hardware engine
-    x = torch.stack([data[i : i + BLOCK_SIZE] for i in ix])
-    y = torch.stack([data[i + 1 : i + BLOCK_SIZE + 1] for i in ix])
+    # Create a 2D grid of indices natively on the GPU
+    start_positions = ix.unsqueeze(1) # Shape: (BATCH_SIZE, 1)
+    offsets = torch.arange(BLOCK_SIZE, device=device) # Shape: (BLOCK_SIZE,)
+    
+    grid_indices = start_positions + offsets # Shape: (BATCH_SIZE, BLOCK_SIZE)
+    
+    x = data[grid_indices]
+    y = data[grid_indices + 1] 
     return x, y
 
 # ==========================================
@@ -165,7 +163,7 @@ class PureScratchTransformer(nn.Module):
     def __init__(self, vocab_size, embed_dim, num_heads, num_layers, dropout=0.1):
         super().__init__()
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim)
-        self.pos_encoder = PositionalEncodingFromScratch(embed_dim, max_len=256)
+        self.pos_encoder = PositionalEncodingFromScratch(embed_dim, max_len=max(2048, BLOCK_SIZE))
         self.dropout = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([TransformerBlock(embed_dim, num_heads, dropout) for _ in range(num_layers)])
         self.norm_final = nn.LayerNorm(embed_dim)
@@ -187,7 +185,7 @@ class PureScratchTransformer(nn.Module):
 
 # Instantiate and bind the model to the active computing engine
 model = PureScratchTransformer(
-    vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS, dropout=DROPOUT
+    vocab_size=VOCAB_SIZE, embed_dim=EMBED_DIM, num_heads=NUM_HEADS, num_layers=NUM_LAYERS, dropout=0.1
 ).to(device)
 
 # ==========================================
@@ -206,20 +204,28 @@ def train_scratch_model():
     print(f"📊 Starting unified execution stream for {TOTAL_STEPS} steps...")
     step_start = time.time()
     total_train_loss = 0
-
     # Initialize a master progress bar for the entire training run
     progress_bar = tqdm(total=TOTAL_STEPS, desc="🧠 Training Progress", unit="step")
 
+    # 1. Determine the optimal data type for your hardware
+    amp_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
+
     for step in range(1, TOTAL_STEPS + 1):
         model.train()
-        
-        # Grab a batch natively from active GPU device memory
         batch_x, batch_y = get_batch("train")
         
         optimizer.zero_grad(set_to_none=True)
-        logits = model(batch_x)
-        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), batch_y.view(-1))
         
+        # 2. Wrap your forward pass in PyTorch's Autocast context
+        # Note: Use device_type="cuda" or device_type="cpu" (MPS uses 'cpu' autocast or native support depending on version, 
+        # but for universal compatibility, you can check device.type)
+        device_type = 'cuda' if torch.cuda.is_available() else 'cpu' 
+        amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        
+        with torch.amp.autocast(device_type=device_type, dtype=amp_dtype):
+            logits = model(batch_x)
+            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), batch_y.view(-1))
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -281,7 +287,7 @@ def top_p_filtering(logits, top_p=0.85, filter_value=-float('Inf')):
     logits[indices_to_remove] = filter_value
     return logits
 
-def run_scratch_generation(prompt, max_new_tokens=50, temperature=0.8, top_p=0.85, repetition_penalty=1.3):
+def run_scratch_generation(prompt, max_new_tokens=50, temperature=0.8, top_p=0.85, repetition_penalty=1.05):
     model.eval()
     input_ids = torch.tensor([tokenizer.encode(prompt).ids], dtype=torch.long, device=device)
     generated_tokens, start_time, printed_len = [], time.time(), len(prompt)
@@ -313,6 +319,12 @@ def run_scratch_generation(prompt, max_new_tokens=50, temperature=0.8, top_p=0.8
 # 8. EXECUTION GATEWAY
 # ==========================================
 if __name__ == "__main__":
+    import gc
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    gc.collect()
     train_scratch_model()
     for p in ["the sky is made of", "during the twentieth century, the global economy", "there are six legs on a", "four times six is larger than", "Steve Harvey performs on the famous game show", "The cat is", "The dog is", "The cat and the dog are","He eats the","Notably,","Chinese Businessman Jack Ma ate"," ","I love fruits and"]:
         run_scratch_generation(p)
