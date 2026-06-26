@@ -237,14 +237,27 @@ model = PureScratchTransformer(
 # ==========================================
 # 6. PIPELINED TRAINING ENGINE
 # ==========================================
+def get_lr_multiplier(step, warmup_steps=200, total_steps=2000):
+    """Calculates a learning rate multiplier for linear warmup."""
+    if step < warmup_steps:
+        # Linear warmup phase (0.0 to 1.0)
+        return float(step) / float(max(1, warmup_steps))
+    return 1.0
+
 def train_scratch_model():
     weight_file = "scratch_weights.pt"
     if os.path.exists(weight_file):
         print("🔄 Loading existing stable weights...")
         model.load_state_dict(torch.load(weight_file, map_location=device))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0006, weight_decay=WEIGHT_DECAY, foreach=True)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TOTAL_STEPS)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=WEIGHT_DECAY, foreach=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min',       # We want to minimize loss
+        factor=0.5,       # Multiply LR by 0.5 when loss plateaus (cut in half)
+        patience=2,       # Wait for 2 eval intervals with no improvement before dropping LR
+        verbose=True      # Print a message when the LR drops
+    )
     best_val_loss = float('inf')
 
     print(f"📊 Starting execution stream for {TOTAL_STEPS} steps...")
@@ -274,8 +287,11 @@ def train_scratch_model():
         # 3. Only step weights forward when a full macro-batch sequence ends
         if step % BATCHES_PER_STEP == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            lr_scale = get_lr_multiplier(step, warmup_steps=200, total_steps=TOTAL_STEPS)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 0.001 * lr_scale
             optimizer.step()
-            scheduler.step()
+
         
         # Track logging accurately using the original unscaled metric value
         total_train_loss += (loss.item() * BATCHES_PER_STEP)
@@ -296,6 +312,7 @@ def train_scratch_model():
                     total_val_loss += F.cross_entropy(val_logits.view(-1, VOCAB_SIZE), val_y.view(-1)).item()
             
             avg_val_loss = total_val_loss / val_iters
+            scheduler.step()
             progress_bar.write(
                 f"► Step {step:04d}/{TOTAL_STEPS} | Train Loss: {avg_train_loss:.4f} | "
                 f"Val Loss: {avg_val_loss:.4f} | Interval Time: {time.time() - step_start:.2f}s"
