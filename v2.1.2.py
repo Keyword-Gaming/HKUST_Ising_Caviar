@@ -256,7 +256,6 @@ def train_scratch_model():
         mode='min',       # We want to minimize loss
         factor=0.5,       # Multiply LR by 0.5 when loss plateaus (cut in half)
         patience=2,       # Wait for 2 eval intervals with no improvement before dropping LR
-        verbose=True      # Print a message when the LR drops
     )
     best_val_loss = float('inf')
 
@@ -287,11 +286,13 @@ def train_scratch_model():
         # 3. Only step weights forward when a full macro-batch sequence ends
         if step % BATCHES_PER_STEP == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            lr_scale = get_lr_multiplier(step, warmup_steps=200, total_steps=TOTAL_STEPS)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = 0.001 * lr_scale
+            # Only manually override the learning rate during the active warmup phase
+            if step < 200:
+                lr_scale = get_lr_multiplier(step, warmup_steps=200, total_steps=TOTAL_STEPS)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = 0.0006 * lr_scale
+                    
             optimizer.step()
-
         
         # Track logging accurately using the original unscaled metric value
         total_train_loss += (loss.item() * BATCHES_PER_STEP)
