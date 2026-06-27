@@ -12,14 +12,15 @@ from tokenizers import ByteLevelBPETokenizer
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 
+VOCAB_SIZE = 16384
 EMBED_DIM = 768       
 NUM_HEADS = 12        # 768 / 12 = 64 (head_dim is 64)
 NUM_LAYERS = 6        
-BLOCK_SIZE = 256      
-BATCH_SIZE = 16       
+BLOCK_SIZE = 128      
+BATCH_SIZE = 32       
 BATCHES_PER_STEP = 4
 WEIGHT_DECAY = 0.005
-TOTAL_STEPS = 2000    
+TOTAL_STEPS = 1800    
 EVAL_INTERVAL = 200  
 
 # ==========================================
@@ -32,7 +33,7 @@ elif torch.backends.mps.is_available():
 else:
     device = torch.device("cpu")           
 
-print(f"🚀 INITIALIZING ENGINE ON: {device}")
+print(f"🚀 INITIALIZING v2.1.2 ENGINE ON: {device}")
 
 # ==========================================
 # 3. TEXT LOADING & TOKENIZER MANAGEMENT
@@ -56,7 +57,7 @@ else:
         t.write(corpus_text)
         
     tokenizer = ByteLevelBPETokenizer()
-    tokenizer.train(["temp_corpus.txt"], vocab_size=8192, special_tokens=["<s>", "<pad>", "</s>", "<unk>"])
+    tokenizer.train(["temp_corpus.txt"], vocab_size=VOCAB_SIZE, special_tokens=["<s>", "<pad>", "</s>", "<unk>"])
     tokenizer.save_model(TOKENIZER_DIR)
     os.remove("temp_corpus.txt")
     print(f"✅ Tokenizer saved permanently to '{TOKENIZER_DIR}/'")
@@ -381,8 +382,15 @@ if __name__ == "__main__":
     elif torch.backends.mps.is_available(): torch.mps.empty_cache()
     gc.collect()
     
-    train_scratch_model()
-    
-    for p in ["The cat and the dog are", "I love fruits and"]:
-        run_scratch_generation(p)
+    descision = input("Train Model or Print Prompt (T or P)")
+    if descision[0].upper() == "T":
+        train_scratch_model()
+        for p in ["The cat and the dog are", "I love fruits and", "Over by the shadows", "The three largest donkeys", "two plus two equals", "A small woods housed", "Archie is a child and", "For breakfast there will be", "Beekeepers united for the"]:
+            run_scratch_generation(p)
+            print("\n" + "="*50)
+    elif descision[0].upper() == "P":
+        prompt = input("What sentence would you like the AI to finish?: ")
         print("\n" + "="*50)
+        run_scratch_generation(prompt)
+        print("\n" + "="*50)
+    input("Press enter to exit program: ")
