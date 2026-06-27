@@ -307,12 +307,12 @@ def train_scratch_model():
             val_iters = 20  
             with torch.inference_mode():
                 for _ in range(val_iters):
-                    val_x, val_y = next(val_iters)
+                    val_x, val_y = get_batch("val")
                     val_logits = model(val_x)
                     total_val_loss += F.cross_entropy(val_logits.view(-1, VOCAB_SIZE), val_y.view(-1)).item()
             
             avg_val_loss = total_val_loss / val_iters
-            scheduler.step()
+            scheduler.step(avg_val_loss)
             progress_bar.write(
                 f"► Step {step:04d}/{TOTAL_STEPS} | Train Loss: {avg_train_loss:.4f} | "
                 f"Val Loss: {avg_val_loss:.4f} | Interval Time: {time.time() - step_start:.2f}s"
