@@ -1,0 +1,12 @@
+[project]
+name = "hkust-ising-caviar"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.5.0",
+    "tokenizers>=0.22.2",
+    "torch>=2.12.1",
+    "transformers>=5.12.1",
+]
